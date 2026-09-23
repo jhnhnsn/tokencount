@@ -21,7 +21,8 @@ Ask Claude:
 - "Stop when half my tokens remain" / "Don't go past 80% of the week"
 - "Clear the usage guard"
 
-Or run the script directly: `tokencount`, `tokencount --json`, `tokencount guard --help`.
+Or run the script from a clone of this repo: `./tokencount`, `./tokencount --json`,
+`./tokencount guard --help`.
 
 ## Notes
 
