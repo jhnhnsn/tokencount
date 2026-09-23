@@ -81,3 +81,7 @@ claude plugin validate .
 
 An installed plugin is a cached copy: bump `version` in `.claude-plugin/plugin.json`, then run
 `claude plugin marketplace update tokencount && claude plugin update tokencount@tokencount`.
+
+## License
+
+[MIT](LICENSE)
