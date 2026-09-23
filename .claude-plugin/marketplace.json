@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tokencount",
+  "description": "Claude usage limits and a usage guard for Claude Code.",
+  "owner": {
+    "name": "John Henson"
+  },
+  "plugins": [
+    {
+      "name": "tokencount",
+      "description": "Show your Claude plan, session and weekly usage limits, reset times, burn rate and token counts, and stop work when usage crosses a threshold you set.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

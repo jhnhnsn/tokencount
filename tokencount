@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""tokencount - show your Claude subscription, rate-limit windows and token usage.
+
+Data sources:
+  * ~/.claude/.credentials.json          OAuth token written by Claude Code
+  * api.anthropic.com/api/oauth/profile  account + plan
+  * api.anthropic.com/api/oauth/usage    session (5h) / weekly utilisation and reset times
+  * ~/.claude/projects/**/*.jsonl        local Claude Code transcripts (actual token counts)
+
+Anthropic reports plan limits as percentages, not token counts. Token figures here
+come from your local Claude Code transcripts. The pace projection extrapolates the
+server-reported percentage to the window's reset, scaled by your current burn rate.
+
+API responses are cached in ~/.cache/tokencount/ so a transient error or rate-limit
+falls back to the last good result (up to 30 min old) instead of failing.
+"""
+
+import os
+import sys
+
+# Fast path: the PreToolUse hook runs before every tool call; exit before the
+# heavier imports when no guard is set.
+if sys.argv[1:] == ["guard", "check"] and not os.path.exists(os.path.join(
+        os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")), "tokencount-guard.json")):
+    sys.exit(0)
+
+import argparse
+import glob
+import json
+import statistics
+import time
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"))
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "tokencount")
+API = "https://api.anthropic.com/api/oauth"
+
+PROFILE_TTL = 86400      # the plan rarely changes; refetch at most daily
+STALE_OK = 1800          # serve cached usage up to 30 min old on API error
+
+BURN_RECENT_MIN = 15     # "current" burn rate window
+BURN_BLOCK_MIN = 15      # baseline = median of active blocks this size over 7 days
+BURN_ARROWS = ((4, "⇈", "31"), (2, "↑", "33"), (1.5, "↗", "33"))
+
+WINDOW_DEFS = (("five_hour", "session", "Session (5-hour window)", timedelta(hours=5)),
+               ("seven_day", "week", "Week (7-day window)", timedelta(days=7)))
+
+PLAN_NAMES = {
+    "default_claude_max_20x": "Max (20x)",
+    "default_claude_max_5x": "Max (5x)",
+    "default_claude_pro": "Pro",
+}
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else str(text)
+
+
+def bold(t):
+    return c(t, "1")
+
+
+def dim(t):
+    return c(t, "2")
+
+
+# ------------------------------------------------------------------- API/cache
+
+class APIError(Exception):
+    pass
+
+
+def load_token():
+    path = os.path.join(CLAUDE_DIR, ".credentials.json")
+    try:
+        oauth = json.load(open(path))["claudeAiOauth"]
+    except (OSError, KeyError, ValueError):
+        raise APIError(f"no Claude OAuth credentials at {path} — log in with `claude`")
+    if oauth.get("expiresAt", 0) / 1000 < time.time():
+        raise APIError("OAuth token expired — run `claude` once to refresh it")
+    return oauth["accessToken"]
+
+
+def api_get(endpoint, token):
+    req = urllib.request.Request(
+        f"{API}/{endpoint}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "tokencount/1.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise APIError("rate limited" if e.code == 429 else f"{endpoint}: HTTP {e.code}")
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        raise APIError(f"{endpoint}: {getattr(e, 'reason', e)}")
+
+
+def read_cache(name):
+    try:
+        with open(os.path.join(CACHE_DIR, name)) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_cache(name, data):
+    try:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        path = os.path.join(CACHE_DIR, name)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"_ts": time.time(), "data": data}, fh)
+    except OSError:
+        pass
+
+
+def fetch(endpoint, token, ttl, stale_ok, fresh):
+    """Return (data, age_seconds, error). age is 0 for a live response."""
+    cached = read_cache(f"{endpoint}.json")
+    age = time.time() - cached["_ts"] if cached else None
+    if cached and not fresh and age < ttl:
+        return cached["data"], age, None
+    err = None  # without a token, load_token() has already reported why
+    if token:
+        try:
+            data = api_get(endpoint, token)
+            write_cache(f"{endpoint}.json", data)
+            return data, 0, None
+        except APIError as e:
+            err = str(e)
+    if cached and age < stale_ok:
+        return cached["data"], age, err
+    return None, None, err
+
+
+# ----------------------------------------------------------------- local usage
+
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+
+
+def load_events(since):
+    """[(timestamp, model, usage)] from Claude Code transcripts after `since`."""
+    cutoff = since.timestamp()
+    seen = {}
+    for f in glob.glob(os.path.join(CLAUDE_DIR, "projects", "**", "*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(f) < cutoff:
+                continue
+            fh = open(f, errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                msg = d.get("message")
+                if not isinstance(msg, dict) or not isinstance(msg.get("usage"), dict):
+                    continue
+                model = msg.get("model") or ""
+                if not model or model.startswith("<"):
+                    continue
+                ts = parse_ts(d.get("timestamp"))
+                if not ts or ts < since:
+                    continue
+                # Streaming writes several lines per response; the last one is final.
+                seen[(msg.get("id"), d.get("requestId"))] = (ts, model, msg["usage"])
+    return list(seen.values())
+
+
+def fresh_tokens(t):
+    """Tokens excluding cache reads (which count far less against limits)."""
+    return t.get("input", 0) + t.get("output", 0) + t.get("cache_write", 0)
+
+
+def event_tokens(u):
+    return {
+        "input": u.get("input_tokens") or 0,
+        "output": u.get("output_tokens") or 0,
+        "cache_write": u.get("cache_creation_input_tokens") or 0,
+        "cache_read": u.get("cache_read_input_tokens") or 0,
+    }
+
+
+def aggregate(events, since):
+    per_model = defaultdict(lambda: defaultdict(int))
+    for ts, model, u in events:
+        if ts < since:
+            continue
+        t = per_model[model]
+        for k, v in event_tokens(u).items():
+            t[k] += v
+        t["requests"] += 1
+    totals = defaultdict(int)
+    for t in per_model.values():
+        for k, v in t.items():
+            totals[k] += v
+    return dict(totals), {m: dict(v) for m, v in per_model.items()}
+
+
+def burn_rate(events, now):
+    """Fresh tokens/min over the last 15 min vs the median active 15-min block (7 days).
+
+    Idle blocks are excluded from the baseline so it reflects your working pace.
+    """
+    recent_cut = now - timedelta(minutes=BURN_RECENT_MIN)
+    recent = 0
+    blocks = defaultdict(int)
+    for ts, _, u in events:
+        tok = fresh_tokens(event_tokens(u))
+        if ts >= recent_cut:
+            recent += tok
+        blocks[int(ts.timestamp() // (BURN_BLOCK_MIN * 60))] += tok
+    active = [v for v in blocks.values() if v > 0]
+    recent_tpm = recent / BURN_RECENT_MIN
+    baseline_tpm = statistics.median(active) / BURN_BLOCK_MIN if active else 0
+    return {
+        "recent_tpm": round(recent_tpm),
+        "baseline_tpm": round(baseline_tpm),
+        "ratio": round(recent_tpm / baseline_tpm, 2) if baseline_tpm else None,
+    }
+
+
+def project(pct, resets, length, now, burn_mult):
+    """Extrapolate window utilisation to its reset.
+
+    The window's average fill rate so far is pct / elapsed; scale it by the current
+    burn multiplier (clamped to >=1 so a quiet spell never predicts a drop).
+    """
+    if not resets or pct <= 0:
+        return None
+    left = max(0.0, (resets - now).total_seconds() / 60)
+    elapsed = max(1.0, length.total_seconds() / 60 - left)
+    rate = pct / elapsed * burn_mult  # %/min
+    projected = pct + rate * left
+    hits_100 = now + timedelta(minutes=(100 - pct) / rate) if projected >= 100 else None
+    return {
+        "projected_percent": round(projected, 1),
+        "burn_multiplier": round(burn_mult, 2),
+        "hits_100_at": hits_100.isoformat() if hits_100 else None,
+    }
+
+
+# ------------------------------------------------------------------------ main
+
+def build_report(fresh=False):
+    now = datetime.now(timezone.utc)
+    errors = []
+    try:
+        token = load_token()
+    except APIError as e:
+        token = None
+        errors.append(str(e))
+
+    profile, _, perr = fetch("profile", token, PROFILE_TTL, PROFILE_TTL, fresh)
+    usage, usage_age, uerr = fetch("usage", token, 0, STALE_OK, True)
+    errors += [e for e in (perr, uerr) if e and e not in errors]
+
+    events = load_events(now - timedelta(days=7))
+    burn = burn_rate(events, now)
+    burn_mult = max(1.0, burn["ratio"] or 1.0)
+
+    windows = {}
+    for key, name, _, length in WINDOW_DEFS:
+        w = (usage or {}).get(key) or {}
+        resets = parse_ts(w.get("resets_at"))
+        start = resets - length if resets else now - length
+        totals, per_model = aggregate(events, start)
+        pct = float(w["utilization"]) if w.get("utilization") is not None else None
+        windows[name] = {
+            "percent_used": pct,
+            "percent_left": 100 - pct if pct is not None else None,
+            "resets_at": resets.isoformat() if resets else None,
+            "window_start": start.isoformat(),
+            "locked_reason": w.get("locked_reason"),
+            # Burn rate only reflects the last 15 min, so it only scales the 5h projection.
+            "pace": project(pct or 0, resets, length, now, burn_mult if name == "session" else 1.0),
+            "tokens": totals,
+            "tokens_by_model": per_model,
+        }
+
+    scoped = [
+        {
+            "name": ((l.get("scope") or {}).get("model") or {}).get("display_name") or l.get("kind"),
+            "percent_used": l.get("percent", 0),
+            "resets_at": l.get("resets_at"),
+        }
+        for l in (usage or {}).get("limits") or []
+        if l.get("kind") == "weekly_scoped"
+    ]
+
+    acct, org = (profile or {}).get("account", {}), (profile or {}).get("organization", {})
+    extra = (usage or {}).get("extra_usage") or {}
+    div = 10 ** (extra.get("decimal_places") or 2)
+    return {
+        "generated_at": now.isoformat(),
+        "usage_source": "live" if usage_age == 0 else "cached" if usage else "unavailable",
+        "usage_age_seconds": round(usage_age) if usage_age else 0,
+        "errors": errors,
+        "account": {
+            "name": acct.get("display_name") or acct.get("full_name"),
+            "email": acct.get("email"),
+            "plan": PLAN_NAMES.get(org.get("rate_limit_tier"), org.get("organization_type")),
+            "rate_limit_tier": org.get("rate_limit_tier"),
+            "subscription_status": org.get("subscription_status"),
+            "subscribed_since": org.get("subscription_created_at"),
+            "billing_type": org.get("billing_type"),
+        } if profile else None,
+        "burn_rate": burn,
+        "session": windows["session"],
+        "week": windows["week"],
+        "weekly_model_limits": scoped,
+        "extra_usage": {
+            "enabled": extra.get("is_enabled"),
+            "used": (extra.get("used_credits") or 0) / div,
+            "monthly_limit": (extra.get("monthly_limit") or 0) / div,
+            "currency": extra.get("currency"),
+            "disabled_reason": extra.get("disabled_reason"),
+        } if extra else None,
+        "weekly_breakdown": [
+            {"surface": r["display_name"], "percent": r["percent"]}
+            for r in ((usage or {}).get("seven_day_breakdown") or {}).get("rows", [])
+        ],
+    }
+
+
+# ------------------------------------------------------------------ formatting
+
+def fmt_n(n):
+    for unit, div in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= div:
+            return f"{n / div:.1f}{unit}"
+    return str(int(n))
+
+
+def fmt_delta(td):
+    s = int(td.total_seconds())
+    if s <= 0:
+        return "now"
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m = s // 60
+    parts = [f"{d}d"] if d else []
+    if d or h:
+        parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    return " ".join(parts)
+
+
+def fmt_clock(dt, now):
+    # Resets arrive as e.g. 06:59:59.998; round so they display as 07:00.
+    local = (dt + timedelta(seconds=30)).replace(second=0, microsecond=0).astimezone()
+    fmt = "%H:%M" if local.date() == now.astimezone().date() else "%a %d %b %H:%M"
+    return f"{local.strftime(fmt)} {local.strftime('%Z')}"
+
+
+def bar(pct, width=30):
+    pct = max(0.0, min(100.0, pct))
+    filled = round(width * pct / 100)
+    colour = "32" if pct < 50 else "33" if pct < 80 else "31"
+    return c("█" * filled, colour) + dim("░" * (width - filled))
+
+
+def burn_arrow(burn):
+    r = burn["ratio"]
+    if r is None or burn["recent_tpm"] <= 0:
+        return "", None
+    for threshold, arrow, colour in BURN_ARROWS:
+        if r >= threshold:
+            return arrow, colour
+    return "", None
+
+
+def print_window(title, w, now, show_models):
+    print(bold(title))
+    if w["percent_used"] is None:
+        print(dim("  Plan limits unavailable"))
+    else:
+        print(f"  {bar(w['percent_used'])}  {w['percent_used']:.0f}% used · {bold(f'{w['percent_left']:.0f}% left')}")
+        if w["locked_reason"]:
+            print(c(f"  LOCKED: {w['locked_reason']}", "31"))
+        resets = parse_ts(w["resets_at"])
+        print(f"  Resets   " + (f"{fmt_clock(resets, now)} (in {fmt_delta(resets - now)})" if resets
+                                else dim("no active window")))
+        p = w["pace"]
+        if p:
+            proj = p["projected_percent"]
+            colour = "31" if proj >= 100 else "33" if proj >= 80 else "32"
+            mult = f" at {p['burn_multiplier']:.1f}× current burn" if p["burn_multiplier"] > 1 else ""
+            line = f"  Pace     on track for {c(f'~{min(proj, 999):.0f}%', colour)} by reset{mult}"
+            if p["hits_100_at"]:
+                line += c(f" — limit hit ~{fmt_clock(parse_ts(p['hits_100_at']), now)}", "31")
+            print(line)
+    t = w["tokens"]
+    if t:
+        print(f"  Tokens   {fmt_n(fresh_tokens(t))} fresh "
+              + dim(f"(in {fmt_n(t['input'])} · out {fmt_n(t['output'])} · cache-write {fmt_n(t['cache_write'])})")
+              + f" + {fmt_n(t['cache_read'])} cache-read · {t['requests']} requests")
+        if show_models:
+            for m, mt in sorted(w["tokens_by_model"].items(), key=lambda kv: -fresh_tokens(kv[1])):
+                print(dim(f"    {m:<32} {fmt_n(fresh_tokens(mt)):>7} fresh  {fmt_n(mt['cache_read']):>7} cache-read  {mt['requests']:>5} req"))
+    else:
+        print(dim("  Tokens   no local Claude Code usage in this window"))
+    print()
+
+
+def print_report(r, show_models):
+    now = parse_ts(r["generated_at"])
+    print()
+    if r["usage_source"] != "live":
+        why = "; ".join(r["errors"]) or "unknown error"
+        msg = (f"Showing cached limits from {fmt_delta(timedelta(seconds=r['usage_age_seconds']))} ago ({why})"
+               if r["usage_source"] == "cached" else f"Plan limits unavailable ({why}) — showing local tokens only")
+        print(c(f"⚠ {msg}", "33"))
+        print()
+
+    a = r["account"]
+    if a:
+        print(bold("Account"))
+        print(f"  {a['name']} <{a['email']}>")
+        since = parse_ts(a["subscribed_since"])
+        print(f"  Plan     {bold(a['plan'])} · {a['subscription_status']}"
+              + (f" · since {since.astimezone():%d %b %Y}" if since else ""))
+        print()
+
+    g = read_guard()
+    if g and not guard_expired(g, now):
+        print(bold("Guard") + f"  {describe_guard(g)}")
+        print()
+
+    b = r["burn_rate"]
+    arrow, colour = burn_arrow(b)
+    print(bold("Burn rate") + f"  {fmt_n(b['recent_tpm'])}/min last {BURN_RECENT_MIN}m"
+          + dim(f" · typical {fmt_n(b['baseline_tpm'])}/min")
+          + (f" · {b['ratio']:.1f}×" if b["ratio"] is not None else "")
+          + (" " + c(arrow, colour) if arrow else ""))
+    print()
+
+    for _, name, title, _ in WINDOW_DEFS:
+        print_window(title, r[name], now, show_models)
+
+    if r["weekly_model_limits"]:
+        print(bold("Weekly model limits"))
+        for s in r["weekly_model_limits"]:
+            resets = parse_ts(s["resets_at"])
+            print(f"  {s['name']:<10} {bar(s['percent_used'], 20)}  {s['percent_used']:.0f}% used"
+                  + (dim(f"  resets {fmt_clock(resets, now)}") if resets else ""))
+        print()
+
+    if r["weekly_breakdown"]:
+        print(bold("This week by surface"))
+        print("  " + " · ".join(f"{b['surface']} {b['percent']}%" for b in r["weekly_breakdown"]))
+        print()
+
+    e = r["extra_usage"]
+    if e:
+        state = "on" if e["enabled"] else f"off ({e['disabled_reason']})" if e["disabled_reason"] else "off"
+        print(bold("Extra usage") + f"  {state} · {e['used']:.2f} / {e['monthly_limit']:.2f} {e['currency']} this month")
+        print()
+
+
+# ----------------------------------------------------------------------- guard
+#
+# A guard stops Claude Code once a limit window crosses a threshold. It is
+# enforced by a PreToolUse hook running `tokencount guard check`, which blocks
+# every tool call (except tokencount itself, so the guard can be cleared) until
+# the guard is cleared or the window it was armed in resets.
+
+GUARD_FILE = os.path.join(CLAUDE_DIR, "tokencount-guard.json")
+GUARD_USAGE_TTL = 60     # hook runs on every tool call; hit the API at most once a minute
+
+
+def current_limits(max_age):
+    """{window name: (percent_used, resets_at)} for session, week and scoped model limits."""
+    try:
+        token = load_token()
+    except APIError:
+        token = None
+    usage, _, _ = fetch("usage", token, max_age, STALE_OK, False)
+    if not usage:
+        return None
+    out = {}
+    for key, name, _, _ in WINDOW_DEFS:
+        w = usage.get(key) or {}
+        if w.get("utilization") is not None:
+            out[name] = (float(w["utilization"]), parse_ts(w.get("resets_at")))
+    for l in usage.get("limits") or []:
+        if l.get("kind") == "weekly_scoped":
+            label = ((l.get("scope") or {}).get("model") or {}).get("display_name")
+            if label:
+                out[label.lower()] = (float(l.get("percent") or 0), parse_ts(l.get("resets_at")))
+    return out
+
+
+def read_guard():
+    try:
+        with open(GUARD_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def guard_expired(g, now):
+    resets = parse_ts(g.get("window_resets_at"))
+    return resets is not None and now >= resets
+
+
+def describe_guard(g):
+    return (f"stop when {g['window']} usage reaches {g['stop_at_used']:g}% "
+            f"({100 - g['stop_at_used']:g}% remaining)")
+
+
+def guard_set(args):
+    stop_at = args.used if args.used is not None else 100 - args.remaining
+    if not 0 < stop_at < 100:
+        sys.exit("threshold must be between 0 and 100")
+    window = args.window.lower()
+    limits = current_limits(0)
+    if limits is None:
+        sys.exit("could not read plan limits from the API; guard not set")
+    if window not in limits:
+        sys.exit(f"unknown window '{args.window}'; available: {', '.join(limits)}")
+    pct, resets = limits[window]
+    if pct >= stop_at:
+        sys.exit(f"{window} usage is already {pct:.0f}%, at or past {stop_at:g}%; guard not set")
+    g = {
+        "window": window,
+        "stop_at_used": stop_at,
+        "armed_at": datetime.now(timezone.utc).isoformat(),
+        # Auto-expire when this window resets, so a stale guard never blocks a fresh window.
+        "window_resets_at": resets.isoformat() if resets and not args.persist else None,
+    }
+    with open(GUARD_FILE, "w") as fh:
+        json.dump(g, fh, indent=2)
+    now = datetime.now(timezone.utc)
+    expiry = (f"expires at reset {fmt_clock(resets, now)}" if g["window_resets_at"]
+              else "stays until cleared")
+    print(f"Guard set: {describe_guard(g)}. Currently {pct:.0f}% used; {expiry}.")
+
+
+def guard_status(_):
+    g = read_guard()
+    now = datetime.now(timezone.utc)
+    if not g or guard_expired(g, now):
+        print("No guard set.")
+        return
+    limits = current_limits(GUARD_USAGE_TTL) or {}
+    pct = limits.get(g["window"], (None,))[0]
+    state = ("TRIPPED" if pct is not None and pct >= g["stop_at_used"] else "armed")
+    now_s = f"{pct:.0f}% used now" if pct is not None else "current usage unknown"
+    resets = parse_ts(g.get("window_resets_at"))
+    print(f"Guard {state}: {describe_guard(g)}; {now_s}"
+          + (f"; expires {fmt_clock(resets, now)}." if resets else "; stays until cleared."))
+
+
+def guard_clear(_):
+    try:
+        os.remove(GUARD_FILE)
+        print("Guard cleared.")
+    except FileNotFoundError:
+        print("No guard set.")
+
+
+def guard_check(_):
+    """PreToolUse hook: exit 2 (block, reason on stderr) once the guard trips. Fails open."""
+    g = read_guard()
+    if not g:
+        return
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        event = {}
+    if event.get("tool_name") == "Bash" and "tokencount" in (event.get("tool_input") or {}).get("command", ""):
+        return  # always allow tokencount itself, so the guard can be inspected or cleared
+    now = datetime.now(timezone.utc)
+    if guard_expired(g, now):
+        try:
+            os.remove(GUARD_FILE)
+        except OSError:
+            pass
+        return
+    limits = current_limits(GUARD_USAGE_TTL)
+    if not limits or g["window"] not in limits:
+        return
+    pct, resets = limits[g["window"]]
+    if pct < g["stop_at_used"]:
+        return
+    when = f" It expires when the window resets at {fmt_clock(resets, now)}." if g.get("window_resets_at") and resets else ""
+    sys.stderr.write(
+        f"tokencount guard tripped: {g['window']} usage is {pct:.0f}%, and the user asked to "
+        f"{describe_guard(g)}. Stop working now: make no further tool calls. Tell the user where "
+        f"you got to and what remains. Only if the user explicitly asks to continue, run "
+        f"`python3 \"{os.path.abspath(__file__)}\" guard clear`.{when}\n")
+    sys.exit(2)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Show your Claude plan, session/weekly limits and token usage.")
+    p.add_argument("--json", action="store_true", help="print raw JSON report")
+    p.add_argument("-m", "--models", action="store_true", help="break local token usage down by model")
+    p.add_argument("--refresh", action="store_true", help="refetch the account profile instead of using the daily cache")
+    sub = p.add_subparsers(dest="cmd")
+    guard = sub.add_parser("guard", help="stop Claude Code when a limit window crosses a threshold")
+    gsub = guard.add_subparsers(dest="action", required=True)
+    gs = gsub.add_parser("set", help="arm the guard")
+    th = gs.add_mutually_exclusive_group(required=True)
+    th.add_argument("--used", type=float, help="stop once this percent of the window is used")
+    th.add_argument("--remaining", type=float, help="stop once only this percent of the window remains")
+    gs.add_argument("--window", default="session", help="session (default), week, or a model limit such as fable")
+    gs.add_argument("--persist", action="store_true", help="keep the guard across window resets")
+    gs.set_defaults(func=guard_set)
+    gsub.add_parser("status", help="show the current guard").set_defaults(func=guard_status)
+    gsub.add_parser("clear", help="remove the guard").set_defaults(func=guard_clear)
+    gsub.add_parser("check", help="PreToolUse hook entry point").set_defaults(func=guard_check)
+    args = p.parse_args()
+    if args.cmd == "guard":
+        args.func(args)
+        return
+    report = build_report(fresh=args.refresh)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print_report(report, args.models)
+
+
+if __name__ == "__main__":
+    main()

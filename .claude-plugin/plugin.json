@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "tokencount",
+  "version": "1.0.0",
+  "description": "Show your Claude plan, session and weekly usage limits, reset times, burn rate and token counts, and stop work when usage crosses a threshold you set.",
+  "author": {
+    "name": "John Henson"
+  },
+  "repository": "https://github.com/jhnhnsn/tokencount",
+  "keywords": [
+    "usage",
+    "rate-limits",
+    "tokens",
+    "quota"
+  ],
+  "skills": [
+    "./"
+  ]
+}
