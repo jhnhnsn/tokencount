@@ -21,8 +21,9 @@ python3 "${CLAUDE_PLUGIN_ROOT}/tokencount"         # human-readable; show it whe
 
 Key JSON fields: `account.plan`; `session` / `week` → `percent_used`, `percent_left`, `resets_at`
 (UTC ISO, convert to local time), `pace.projected_percent` (projected use at reset),
-`pace.hits_100_at`; `burn_rate.ratio` (current vs typical pace); `weekly_model_limits`;
-`usage_source` (`live`, `cached` or `unavailable`, say so if not live).
+`pace.hits_100_at`; `today.percent_of_week` (how much of the week today has used, since local
+midnight; estimated from local logs, so approximate) and `today.even_daily_share` (14.3);
+`burn_rate.ratio` (current vs typical pace); `weekly_model_limits`; `usage_source` (`live`, `cached` or `unavailable`, say so if not live).
 
 Answer the question asked in a sentence or two. Don't paste the whole report unless asked.
 

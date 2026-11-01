@@ -28,6 +28,7 @@ import argparse
 import glob
 import json
 import statistics
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -75,12 +76,30 @@ class APIError(Exception):
     pass
 
 
-def load_token():
-    path = os.path.join(CLAUDE_DIR, ".credentials.json")
+def read_oauth():
+    """Claude Code's OAuth login: the credentials file, or on macOS the login Keychain."""
     try:
-        oauth = json.load(open(path))["claudeAiOauth"]
+        return json.load(open(os.path.join(CLAUDE_DIR, ".credentials.json")))["claudeAiOauth"]
     except (OSError, KeyError, ValueError):
-        raise APIError(f"no Claude OAuth credentials at {path} — log in with `claude`")
+        pass
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                return json.loads(out.stdout)["claudeAiOauth"]
+        except (OSError, subprocess.SubprocessError, KeyError, ValueError):
+            pass
+    return None
+
+
+def load_token():
+    oauth = read_oauth()
+    if not oauth:
+        where = "the credentials file or the macOS Keychain" if sys.platform == "darwin" else \
+            os.path.join(CLAUDE_DIR, ".credentials.json")
+        raise APIError(f"no Claude OAuth credentials in {where} — log in with `claude`")
     if oauth.get("expiresAt", 0) / 1000 < time.time():
         raise APIError("OAuth token expired — run `claude` once to refresh it")
     return oauth["accessToken"]
@@ -292,6 +311,27 @@ def build_report(fresh=False):
             "tokens_by_model": per_model,
         }
 
+    # Today's share of the week. The API only reports the week as a whole, so scale its
+    # percentage by today's share of the week's local fresh tokens: since local midnight,
+    # or since the window started if it reset today. Approximate: models weigh differently
+    # against the limit, and other devices and claude.ai aren't in the local logs.
+    week = windows["week"]
+    # Local midnight with its own UTC offset, which differs from now's on a DST changeover day.
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
+    day_start = max(midnight, parse_ts(week["window_start"]))
+    day_tokens, _ = aggregate(events, day_start)
+    week_fresh = fresh_tokens(week["tokens"])
+    if week["percent_used"] is None:
+        day_pct = None
+    else:
+        day_pct = round(week["percent_used"] * fresh_tokens(day_tokens) / week_fresh, 1) if week_fresh else 0.0
+    today = {
+        "percent_of_week": day_pct,
+        "even_daily_share": round(100 / 7, 1),
+        "since": day_start.isoformat(),
+        "tokens": day_tokens,
+    }
+
     scoped = [
         {
             "name": ((l.get("scope") or {}).get("model") or {}).get("display_name") or l.get("kind"),
@@ -322,6 +362,7 @@ def build_report(fresh=False):
         "burn_rate": burn,
         "session": windows["session"],
         "week": windows["week"],
+        "today": today,
         "weekly_model_limits": scoped,
         "extra_usage": {
             "enabled": extra.get("is_enabled"),
@@ -389,7 +430,8 @@ def print_window(title, w, now, show_models):
     if w["percent_used"] is None:
         print(dim("  Plan limits unavailable"))
     else:
-        print(f"  {bar(w['percent_used'])}  {w['percent_used']:.0f}% used · {bold(f'{w['percent_left']:.0f}% left')}")
+        left = bold(f"{w['percent_left']:.0f}% left")
+        print(f"  {bar(w['percent_used'])}  {w['percent_used']:.0f}% used · {left}")
         if w["locked_reason"]:
             print(c(f"  LOCKED: {w['locked_reason']}", "31"))
         resets = parse_ts(w["resets_at"])
@@ -451,6 +493,13 @@ def print_report(r, show_models):
 
     for _, name, title, _ in WINDOW_DEFS:
         print_window(title, r[name], now, show_models)
+
+    t = r["today"]
+    if t["percent_of_week"] is not None:
+        print(bold("Today") + f"  ~{t['percent_of_week']:.1f}% of the week"
+              + dim(f" · {fmt_n(fresh_tokens(t['tokens']))} fresh tokens since {fmt_clock(parse_ts(t['since']), now)}"
+                    f" · an even day is {t['even_daily_share']:.1f}%"))
+        print()
 
     if r["weekly_model_limits"]:
         print(bold("Weekly model limits"))
