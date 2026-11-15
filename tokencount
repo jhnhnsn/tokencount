@@ -638,6 +638,9 @@ def guard_set(args):
         # A standing rule: each new week starts again at day 1, so it never expires.
         g = {"window": window, "rolling_daily": args.rolling,
              "armed_at": now.isoformat(), "window_resets_at": None}
+        # For hooks of tokencount before 1.2 (sessions not yet restarted), which read only
+        # this field: they hold to the limit when the guard was set. This version ignores it.
+        g["stop_at_used"] = round(guard_limit(g, resets, now)[0], 1)
     else:
         if pct >= stop_at:
             sys.exit(f"{window} usage is already {pct:.0f}%, at or past {stop_at:g}%; guard not set")
