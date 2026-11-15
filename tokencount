@@ -567,37 +567,94 @@ def guard_expired(g, now):
     return resets is not None and now >= resets
 
 
-def describe_guard(g):
-    return (f"stop when {g['window']} usage reaches {g['stop_at_used']:g}% "
-            f"({100 - g['stop_at_used']:g}% remaining)")
+def rolling_day(resets, now):
+    """(day, start of the next day) in the 7-day window that ends at resets.
+
+    Days are 24-hour periods from the window's start (resets - 7 days), not calendar
+    dates, so they follow the window's own reset time. None if resets is unknown or
+    past: a reading from a window that has ended says nothing about the new one.
+    """
+    if resets is None or resets <= now:
+        return None
+    start = resets - timedelta(days=7)
+    day = max(1, min(7, (now - start) // timedelta(days=1) + 1))
+    return day, start + timedelta(days=day)
+
+
+def guard_limit(g, resets, now):
+    """(stop_at_used, day or None) for a guard; stop_at_used is None if it can't be worked out.
+
+    A rolling guard's limit is the daily share x the day of the window, at most 100.
+    """
+    share = g.get("rolling_daily")
+    if share is None:
+        return g["stop_at_used"], None
+    d = rolling_day(resets, now)
+    if d is None:
+        return None, None
+    return min(100.0, share * d[0]), d[0]
+
+
+def describe_guard(g, resets=None, now=None):
+    share = g.get("rolling_daily")
+    if share is None:
+        return (f"stop when {g['window']} usage reaches {g['stop_at_used']:g}% "
+                f"({100 - g['stop_at_used']:g}% remaining)")
+    text = f"hold {g['window']} usage to {share:g}% a day, rolling"
+    if now is not None:
+        stop_at, day = guard_limit(g, resets, now)
+        if stop_at is not None:
+            text += f" (day {day} of 7: stop at {stop_at:.1f}%)"
+    return text
+
+
+def guard_paused(g, now):
+    until = parse_ts(g.get("paused_until"))
+    return until is not None and now < until
 
 
 def guard_set(args):
-    stop_at = args.used if args.used is not None else 100 - args.remaining
-    if not 0 < stop_at < 100:
-        sys.exit("threshold must be between 0 and 100")
     window = args.window.lower()
+    rolling = args.rolling is not None
+    if rolling:
+        if not 0 < args.rolling <= 100:
+            sys.exit("daily share must be above 0 and at most 100")
+        if window == "session":
+            sys.exit("a rolling daily cap needs a weekly window: add --window week")
+    else:
+        stop_at = args.used if args.used is not None else 100 - args.remaining
+        if not 0 < stop_at < 100:
+            sys.exit("threshold must be between 0 and 100")
     limits = current_limits(0)
     if limits is None:
         sys.exit("could not read plan limits from the API; guard not set")
     if window not in limits:
         sys.exit(f"unknown window '{args.window}'; available: {', '.join(limits)}")
     pct, resets = limits[window]
-    if pct >= stop_at:
-        sys.exit(f"{window} usage is already {pct:.0f}%, at or past {stop_at:g}%; guard not set")
-    g = {
-        "window": window,
-        "stop_at_used": stop_at,
-        "armed_at": datetime.now(timezone.utc).isoformat(),
-        # Auto-expire when this window resets, so a stale guard never blocks a fresh window.
-        "window_resets_at": resets.isoformat() if resets and not args.persist else None,
-    }
+    now = datetime.now(timezone.utc)
+    if rolling:
+        if rolling_day(resets, now) is None:
+            sys.exit(f"could not read when the {window} window resets; guard not set")
+        # A standing rule: each new week starts again at day 1, so it never expires.
+        g = {"window": window, "rolling_daily": args.rolling,
+             "armed_at": now.isoformat(), "window_resets_at": None}
+    else:
+        if pct >= stop_at:
+            sys.exit(f"{window} usage is already {pct:.0f}%, at or past {stop_at:g}%; guard not set")
+        g = {
+            "window": window,
+            "stop_at_used": stop_at,
+            "armed_at": now.isoformat(),
+            # Auto-expire when this window resets, so a stale guard never blocks a fresh window.
+            "window_resets_at": resets.isoformat() if resets and not args.persist else None,
+        }
     with open(GUARD_FILE, "w") as fh:
         json.dump(g, fh, indent=2)
-    now = datetime.now(timezone.utc)
     expiry = (f"expires at reset {fmt_clock(resets, now)}" if g["window_resets_at"]
               else "stays until cleared")
-    print(f"Guard set: {describe_guard(g)}. Currently {pct:.0f}% used; {expiry}.")
+    print(f"Guard set: {describe_guard(g, resets, now)}. Currently {pct:.0f}% used; {expiry}.")
+    if rolling and pct >= guard_limit(g, resets, now)[0]:
+        print("That is at or past today's limit, so the guard blocks tool calls now.")
 
 
 def guard_status(_):
@@ -607,12 +664,16 @@ def guard_status(_):
         print("No guard set.")
         return
     limits = current_limits(GUARD_USAGE_TTL) or {}
-    pct = limits.get(g["window"], (None,))[0]
-    state = ("TRIPPED" if pct is not None and pct >= g["stop_at_used"] else "armed")
+    pct, resets = limits.get(g["window"], (None, None))
+    stop_at, _ = guard_limit(g, resets, now)
+    if guard_paused(g, now):
+        state = f"paused until {fmt_clock(parse_ts(g['paused_until']), now)}"
+    else:
+        state = "TRIPPED" if pct is not None and stop_at is not None and pct >= stop_at else "armed"
     now_s = f"{pct:.0f}% used now" if pct is not None else "current usage unknown"
-    resets = parse_ts(g.get("window_resets_at"))
-    print(f"Guard {state}: {describe_guard(g)}; {now_s}"
-          + (f"; expires {fmt_clock(resets, now)}." if resets else "; stays until cleared."))
+    expires = parse_ts(g.get("window_resets_at"))
+    print(f"Guard {state}: {describe_guard(g, resets, now)}; {now_s}"
+          + (f"; expires {fmt_clock(expires, now)}." if expires else "; stays until cleared."))
 
 
 def guard_clear(_):
@@ -621,6 +682,25 @@ def guard_clear(_):
         print("Guard cleared.")
     except FileNotFoundError:
         print("No guard set.")
+
+
+def guard_pause(_):
+    """Let a rolling guard's work go on until its limit next rises, then check again."""
+    g = read_guard()
+    now = datetime.now(timezone.utc)
+    if not g or guard_expired(g, now):
+        print("No guard set.")
+        return
+    if g.get("rolling_daily") is None:
+        sys.exit("only a rolling guard can pause; use `guard clear` to remove this one")
+    limits = current_limits(GUARD_USAGE_TTL) or {}
+    d = rolling_day(limits.get(g["window"], (None, None))[1], now)
+    if d is None:
+        sys.exit(f"could not read when the {g['window']} window resets; guard not paused")
+    g["paused_until"] = d[1].isoformat()
+    with open(GUARD_FILE, "w") as fh:
+        json.dump(g, fh, indent=2)
+    print(f"Guard paused until {fmt_clock(d[1], now)}, when the next day's limit starts.")
 
 
 def guard_check(_):
@@ -641,18 +721,31 @@ def guard_check(_):
         except OSError:
             pass
         return
+    if guard_paused(g, now):
+        return
     limits = current_limits(GUARD_USAGE_TTL)
     if not limits or g["window"] not in limits:
         return
     pct, resets = limits[g["window"]]
-    if pct < g["stop_at_used"]:
+    stop_at, _ = guard_limit(g, resets, now)
+    if stop_at is None or pct < stop_at:
         return
-    when = f" It expires when the window resets at {fmt_clock(resets, now)}." if g.get("window_resets_at") and resets else ""
+    me = f"python3 \"{os.path.abspath(__file__)}\""
+    if g.get("rolling_daily") is not None:
+        nxt = rolling_day(resets, now)[1]
+        when = (f" The limit rises at {fmt_clock(nxt, now)}." if nxt < resets
+                else f" The window resets at {fmt_clock(resets, now)}.")
+        go_on = (f"run `{me} guard pause` (until the limit rises) or `{me} guard clear` "
+                 f"(removes the daily cap).")
+    else:
+        when = (f" It expires when the window resets at {fmt_clock(resets, now)}."
+                if g.get("window_resets_at") and resets else "")
+        go_on = f"run `{me} guard clear`."
     sys.stderr.write(
         f"tokencount guard tripped: {g['window']} usage is {pct:.0f}%, and the user asked to "
-        f"{describe_guard(g)}. Stop working now: make no further tool calls. Tell the user where "
-        f"you got to and what remains. Only if the user explicitly asks to continue, run "
-        f"`python3 \"{os.path.abspath(__file__)}\" guard clear`.{when}\n")
+        f"{describe_guard(g, resets, now)}. Stop working now: make no further tool calls. Tell the "
+        f"user where you got to and what remains. Only if the user explicitly asks to continue, "
+        f"{go_on}{when}\n")
     sys.exit(2)
 
 
@@ -668,11 +761,16 @@ def main():
     th = gs.add_mutually_exclusive_group(required=True)
     th.add_argument("--used", type=float, help="stop once this percent of the window is used")
     th.add_argument("--remaining", type=float, help="stop once only this percent of the window remains")
+    th.add_argument("--rolling", type=float, metavar="SHARE",
+                    help="rolling daily cap for a weekly window: on day N of the week, stop once "
+                         "N x SHARE percent is used (14.3 is an even day); stays until cleared")
     gs.add_argument("--window", default="session", help="session (default), week, or a model limit such as fable")
     gs.add_argument("--persist", action="store_true", help="keep the guard across window resets")
     gs.set_defaults(func=guard_set)
     gsub.add_parser("status", help="show the current guard").set_defaults(func=guard_status)
     gsub.add_parser("clear", help="remove the guard").set_defaults(func=guard_clear)
+    gsub.add_parser("pause", help="let a rolling guard's work go on until its limit next rises"
+                    ).set_defaults(func=guard_pause)
     gsub.add_parser("check", help="PreToolUse hook entry point").set_defaults(func=guard_check)
     args = p.parse_args()
     if args.cmd == "guard":
