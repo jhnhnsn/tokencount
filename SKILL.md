@@ -1,6 +1,6 @@
 ---
 name: tokencount
-description: Check the user's Claude plan, session (5-hour) and weekly usage limits, reset times, burn rate and token counts, and set a guard that stops work when usage crosses a threshold. Use when the user asks how much usage or how many tokens they have left, when limits reset, what plan they are on, or says things like "stop when half my tokens remain", "don't go past 80% of my session", "leave me 20% of the week", or "clear the usage guard".
+description: Check the user's Claude plan, session (5-hour) and weekly usage limits, reset times, burn rate and token counts, and set a guard that stops work when usage crosses a threshold. Use when the user asks how much usage or how many tokens they have left, when limits reset, what plan they are on, or says things like "stop when half my tokens remain", "don't go past 80% of my session", "leave me 20% of the week", "hold me to a rolling daily cap", or "clear the usage guard".
 allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/tokencount" *)
 ---
 
@@ -37,7 +37,9 @@ tokencount guard set --remaining 50              # "stop when half my tokens rem
 tokencount guard set --used 80                   # "stop at 80%" / "don't go past 80%"
 tokencount guard set --remaining 20 --window week   # "leave me 20% of the week"
 tokencount guard set --used 90 --window fable    # a per-model weekly limit
+tokencount guard set --rolling 14.3 --window week   # "rolling daily cap", "a seventh of the week a day"
 tokencount guard status
+tokencount guard pause                           # rolling only: let work go on until the limit rises
 tokencount guard clear
 ```
 (`tokencount` above is shorthand: always run it as `python3 "${CLAUDE_PLUGIN_ROOT}/tokencount"`.)
@@ -48,6 +50,11 @@ Mapping requests:
 - "X% remain / left / leave me X%" → `--remaining X`. "at X% / X% used / past X%" → `--used X`.
 - The guard expires on its own when that window resets. Add `--persist` only if the user wants it
   to outlive the reset.
+- "Daily cap", "X% a day" or "rolling" → `--rolling X --window week` (14.3 if no share is given:
+  an even seventh). On day N of the usage week the limit is N × X, so a light day leaves more for
+  the next. Days are 24-hour periods from the week's start (7 days before `week.resets_at`), not
+  calendar dates. A rolling guard is a standing rule: it never expires, and each week starts again
+  at day 1. Only a weekly window can be rolling.
 - After setting it, confirm in one line: window, threshold, current usage, expiry.
 
 Usage percentages from the API move in coarse steps and are cached for up to a minute, so the
@@ -58,4 +65,6 @@ guard can trip slightly past the threshold. Mention this if the user needs a har
 A blocked tool call returns a message starting `tokencount guard tripped`. Then:
 1. Stop. Make no further tool calls, and don't retry or work around the block.
 2. Tell the user what you finished, what remains, and the current usage.
-3. Run `tokencount guard clear` only if the user explicitly asks to continue.
+3. Only if the user explicitly asks to continue: for a rolling guard, run `tokencount guard pause`
+   (the daily cap comes back when the next day's limit starts) unless they want the cap gone; for
+   any other guard, run `tokencount guard clear`.

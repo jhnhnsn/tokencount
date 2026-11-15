@@ -20,6 +20,7 @@ Ask Claude:
 - "How much of the week have I used today?"
 - "When does my weekly limit reset?"
 - "Stop when half my tokens remain" / "Don't go past 80% of the week"
+- "Hold me to a rolling daily cap of 14.3%"
 - "Clear the usage guard"
 
 Or run the script from a clone of this repo: `./tokencount`, `./tokencount --json`,
@@ -35,6 +36,10 @@ Or run the script from a clone of this repo: `./tokencount`, `./tokencount --jso
   devices aren't in the local logs.
 - A guard blocks tool calls in every Claude Code session on your account until you clear
   it or the usage window resets.
+- A rolling daily cap (`guard set --rolling 14.3 --window week`) lets day N of the usage week
+  use N × 14.3% of it, so a light day leaves more for the next. Days are 24-hour periods from
+  the week's reset time, not calendar dates. It stays until you clear it; `guard pause` lets
+  work go on until the next day's limit starts.
 
 ## License
 
